@@ -260,6 +260,44 @@ fn image_from_ktx2(
     .map_err(|error| error.to_string())
 }
 
+/// Returns the dimensions of the primary texture in a BMAT bundle.
+///
+/// Map loaders can use this before the material asset and its dependent images
+/// are available, ensuring authored texel-space UVs are normalized correctly.
+pub fn texture_size(bytes: &[u8]) -> Result<UVec2, String> {
+    let entries = read_tar_entries(bytes)?;
+    let manifest_bytes = entries
+        .get("manifest.ron")
+        .ok_or_else(|| "missing manifest.ron".to_owned())?;
+    let manifest: BmatManifest =
+        ron::de::from_bytes(manifest_bytes).map_err(|error| error.to_string())?;
+    if manifest.version != 1 {
+        return Err(format!("unsupported manifest version {}", manifest.version));
+    }
+    let path = manifest
+        .base_color_texture
+        .as_ref()
+        .or(manifest.data_texture.as_ref())
+        .ok_or_else(|| "manifest has no texture suitable for sizing".to_owned())?;
+    let ktx2 = entries
+        .get(path)
+        .ok_or_else(|| format!("manifest references missing {path}"))?;
+    ktx2_size(ktx2).map_err(|error| format!("invalid KTX2 texture {path}: {error}"))
+}
+
+fn ktx2_size(bytes: &[u8]) -> Result<UVec2, String> {
+    const IDENTIFIER: &[u8; 12] = b"\xABKTX 20\xBB\r\n\x1A\n";
+    if bytes.len() < 28 || &bytes[..12] != IDENTIFIER {
+        return Err("invalid identifier or truncated header".to_owned());
+    }
+    let width = u32::from_le_bytes(bytes[20..24].try_into().expect("four-byte slice"));
+    let height = u32::from_le_bytes(bytes[24..28].try_into().expect("four-byte slice"));
+    if width == 0 || height == 0 {
+        return Err(format!("invalid dimensions {width}x{height}"));
+    }
+    Ok(UVec2::new(width, height))
+}
+
 fn read_tar_entries(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut entries = BTreeMap::new();
     let mut offset = 0;
@@ -312,5 +350,29 @@ mod tests {
 
         let entries = read_tar_entries(&archive).unwrap();
         assert_eq!(entries.get("test"), Some(&b"abc".to_vec()));
+    }
+
+    #[test]
+    fn reads_primary_texture_size() {
+        let manifest = b"(version:1,base_color_texture:Some(\"albedo.ktx2\"),normal_map_texture:None,metallic_roughness_texture:None,occlusion_texture:None,emissive_texture:None,data_texture:None,alpha_mode:Opaque)";
+        let mut ktx2 = vec![0; 28];
+        ktx2[..12].copy_from_slice(b"\xABKTX 20\xBB\r\n\x1A\n");
+        ktx2[20..24].copy_from_slice(&512u32.to_le_bytes());
+        ktx2[24..28].copy_from_slice(&256u32.to_le_bytes());
+        let mut archive = Vec::new();
+        for (name, data) in [
+            ("manifest.ron", manifest.as_slice()),
+            ("albedo.ktx2", &ktx2),
+        ] {
+            let mut header = [0; 512];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            let size = format!("{:011o}\0", data.len());
+            header[124..136].copy_from_slice(size.as_bytes());
+            archive.extend_from_slice(&header);
+            archive.extend_from_slice(data);
+            archive.resize(archive.len().div_ceil(512) * 512, 0);
+        }
+        archive.extend_from_slice(&[0; 1024]);
+        assert_eq!(texture_size(&archive), Ok(UVec2::new(512, 256)));
     }
 }
