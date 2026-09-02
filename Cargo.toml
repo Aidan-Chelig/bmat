@@ -1,0 +1,28 @@
+[package]
+name = "bmat"
+version = "0.1.0"
+edition = "2024"
+description = "Bevy material bundles and an OpenRaster-to-BMAT compiler"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["converter"]
+converter = ["dep:exr", "dep:glob", "dep:image", "dep:ktx2", "dep:quick-xml", "dep:zip"]
+hot_reload = ["bevy/file_watcher"]
+
+[[bin]]
+name = "ora_to_bmat"
+path = "src/bin/ora_to_bmat.rs"
+required-features = ["converter"]
+
+[dependencies]
+bevy = { version = "0.19.1" }
+bevy_trenchbroom = { version = "0.14.0" }
+ron = "0.11.0"
+serde = { version = "1.0", features = ["derive"] }
+exr = { version = "1.74.0", optional = true }
+glob = { version = "0.3.4", optional = true }
+image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
+ktx2 = { version = "0.5.0", optional = true }
+quick-xml = { version = "0.41.0", optional = true }
+zip = { version = "0.6.6", default-features = false, features = ["deflate"], optional = true }
