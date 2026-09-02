@@ -289,63 +289,6 @@ pub fn convert_file(
     write_outputs(input, output_dir, base, overwrite, outputs)
 }
 
-/// Writes an uncompressed 8-bit image as the albedo texture of a BMAT bundle.
-///
-/// `channels` must be 1 (luminance), 2 (luminance/alpha), 3 (RGB), or 4
-/// (RGBA). Luminance inputs are expanded to RGB because BMAT base-color
-/// textures use color KTX2 formats.
-pub fn write_albedo_bmat(
-    output: &Path,
-    width: usize,
-    height: usize,
-    pixels: &[u8],
-    channels: usize,
-    overwrite: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !(1..=4).contains(&channels) || pixels.len() != width * height * channels {
-        return Err(format!(
-            "invalid {}x{} image with {channels} channels and {} bytes",
-            width,
-            height,
-            pixels.len()
-        )
-        .into());
-    }
-    let output_dir = output.parent().unwrap_or_else(|| Path::new("."));
-    let base = output
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| format!("output has no valid file stem: {}", output.display()))?;
-    let output_channels = if channels == 2 || channels == 4 { 4 } else { 3 };
-    let mut values = Vec::with_capacity(width * height * output_channels);
-    for pixel in pixels.chunks_exact(channels) {
-        let channel = |index: usize| f32::from(pixel[index]) / 255.0;
-        match channels {
-            1 => values.extend_from_slice(&[channel(0), channel(0), channel(0)]),
-            2 => values.extend_from_slice(&[channel(0), channel(0), channel(0), channel(1)]),
-            3 => values.extend_from_slice(&[channel(0), channel(1), channel(2)]),
-            4 => values.extend_from_slice(&[channel(0), channel(1), channel(2), channel(3)]),
-            _ => unreachable!(),
-        }
-    }
-    write_outputs(
-        output,
-        output_dir,
-        base,
-        overwrite,
-        vec![(
-            "albedo",
-            SemanticImage {
-                width,
-                height,
-                channels: output_channels,
-                pixels: values,
-            },
-            true,
-        )],
-    )
-}
-
 fn default_orm_pixels(pixel_count: usize) -> Vec<f32> {
     vec![1.0, 1.0, 0.0].repeat(pixel_count)
 }
@@ -1032,18 +975,6 @@ fn greatest_common_divisor(mut left: usize, mut right: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn writes_raw_albedo_as_bmat() {
-        let dir = std::env::temp_dir().join(format!("bmat_raw_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let output = dir.join("preview.bmat");
-        write_albedo_bmat(&output, 1, 1, &[128, 64, 32, 255], 4, true).unwrap();
-        let entries = crate::read_tar_entries(&fs::read(&output).unwrap()).unwrap();
-        assert!(entries.contains_key("albedo.ktx2"));
-        assert!(entries.contains_key("manifest.ron"));
-        fs::remove_dir_all(dir).unwrap();
-    }
 
     #[test]
     fn missing_orm_channels_use_neutral_defaults() {
