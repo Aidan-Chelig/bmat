@@ -1,4 +1,5 @@
 use bevy::{
+    core_pipeline::Skybox,
     camera::{CameraOutputMode, Viewport, visibility::RenderLayers},
     image::ImageAddressMode,
     prelude::*,
@@ -8,15 +9,23 @@ use bevy::{
 use bevy_egui::{
     EguiContexts, EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass, PrimaryEguiContext, egui,
 };
+use bmat::editor_workflow::{self as workflow, History, Stamp};
 use bmat::{
     BmatAlphaMode,
     editor::{ChannelSource, Document, Pixels, ScalarInput, decode},
     image_from_ktx2,
 };
+use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Resource)]
 struct Editor {
+    history: History,
+    saved: Document,
+    editing_gesture: bool,
+    watch: Option<WatchFolder>,
+    texture_action: Option<(String, String, bool)>,
+    export_key: Option<String>,
     import_draft: Option<ImportDraft>,
     texture_info: BTreeMap<String, String>,
     path: PathBuf,
@@ -34,6 +43,13 @@ struct Editor {
     images: Vec<Handle<Image>>,
     rotate: bool,
 }
+struct WatchFolder {
+    path: PathBuf,
+    enabled: bool,
+    last: Stamp,
+    pending: Option<Stamp>,
+    next: Instant,
+}
 struct ImportDraft {
     pixels: Pixels,
     name: String,
@@ -44,6 +60,9 @@ struct ImportDraft {
 }
 #[derive(Clone, Copy)]
 enum Dialog {
+    ExportFolder,
+    ImportFolder,
+    ExportTexture,
     New,
     Open,
     SaveAs,
@@ -52,6 +71,54 @@ enum Dialog {
 }
 #[derive(Component)]
 struct Cube;
+
+#[derive(Resource)]
+struct OrbitCamera { target: Vec3, yaw: f32, pitch: f32, distance: f32 }
+impl Default for OrbitCamera {
+    fn default() -> Self {
+        let pos = Vec3::new(3.5, 2.5, 5.);
+        Self { target: Vec3::ZERO, yaw: pos.x.atan2(pos.z), pitch: (pos.y / pos.length()).asin(), distance: pos.length() }
+    }
+}
+impl OrbitCamera {
+    fn rotation(&self) -> Quat { Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(-self.pitch) }
+    fn transform(&self) -> Transform {
+        Transform::from_translation(self.target + self.rotation() * Vec3::Z * self.distance).looking_at(self.target, Vec3::Y)
+    }
+    fn orbit(&mut self, delta: egui::Vec2) {
+        self.yaw = (self.yaw - delta.x * 0.007).rem_euclid(std::f32::consts::TAU);
+        self.pitch = (self.pitch + delta.y * 0.007).clamp(-1.5, 1.5);
+    }
+    fn zoom(&mut self, scroll: f32) { self.distance = (self.distance * (-scroll * 0.002).exp()).clamp(2.2, 50.); }
+    fn pan(&mut self, delta: egui::Vec2, height: f32) {
+        let scale = 2. * self.distance * (std::f32::consts::FRAC_PI_8).tan() / height.max(1.);
+        self.target += self.rotation() * Vec3::new(-delta.x, delta.y, 0.) * scale;
+    }
+}
+
+#[cfg(test)]
+mod orbit_tests {
+    use super::*;
+    #[test]
+    fn default_view_matches_initial_camera() {
+        let view = OrbitCamera::default().transform();
+        assert!(view.translation.abs_diff_eq(Vec3::new(3.5,2.5,5.), 0.00001));
+        assert!(view.forward().as_vec3().abs_diff_eq(-view.translation.normalize(), 0.00001));
+    }
+    #[test]
+    fn orbit_and_zoom_remain_bounded() {
+        let mut orbit = OrbitCamera::default();
+        orbit.orbit(egui::vec2(100000.,100000.));
+        assert_eq!(orbit.pitch, 1.5);
+        orbit.zoom(100000.);
+        assert_eq!(orbit.distance, 2.2);
+        orbit.zoom(-100000.);
+        assert_eq!(orbit.distance, 50.);
+        orbit.pan(egui::vec2(10.,20.), 600.);
+        assert!(orbit.transform().translation.is_finite());
+        assert_ne!(orbit.target, Vec3::ZERO);
+    }
+}
 
 fn main() {
     let path = std::env::args_os()
@@ -85,6 +152,12 @@ fn main() {
             EguiPlugin::default(),
         ))
         .insert_resource(Editor {
+            history: History::default(),
+            saved: doc.clone(),
+            editing_gesture: false,
+            watch: None,
+            texture_action: None,
+            export_key: None,
             import_draft: None,
             texture_info: BTreeMap::new(),
             path,
@@ -108,12 +181,14 @@ fn main() {
             ..default()
         })
         .add_systems(Startup, setup)
+        .init_resource::<OrbitCamera>()
         .add_systems(Update, (rebuild, rotate, close_request).chain())
         .add_systems(EguiPrimaryContextPass, ui)
         .run();
 }
 fn setup(
     mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut editor: ResMut<Editor>,
@@ -121,6 +196,11 @@ fn setup(
 ) {
     egui_settings.auto_create_primary_context = false;
     editor.material = materials.add(StandardMaterial::default());
+    let skybox = images.add(image_from_ktx2(
+        include_bytes!("../../assets/sky_skybox.ktx2"),
+        false,
+        ImageAddressMode::ClampToEdge,
+    ).expect("Bundled skybox must be a valid KTX2 cubemap"));
     let mut cube = Mesh::from(Cuboid::from_length(2.));
     cube.generate_tangents()
         .expect("Preview cube has valid normals and UVs");
@@ -132,6 +212,7 @@ fn setup(
     ));
     commands.spawn((
         Camera3d::default(),
+        Skybox { image: Some(skybox), brightness: 1000.0, rotation: Quat::IDENTITY },
         Transform::from_xyz(3.5, 2.5, 5.).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
@@ -260,6 +341,7 @@ fn rebuild(
 fn save(editor: &mut Editor, path: PathBuf) {
     match editor.doc.save(&path) {
         Ok(()) => {
+            editor.saved = editor.doc.clone();
             editor.path = path;
             editor.dirty = false;
             editor.status = "Saved".into();
@@ -348,17 +430,32 @@ fn import_options(ui: &mut egui::Ui, d: &mut ImportDraft) {
     }
 }
 fn dialog(editor: &mut Editor, kind: Dialog) {
+    if matches!(kind, Dialog::ExportTexture) {
+        editor.export_key = editor.selected.as_ref().map(|(key, _)| key.clone());
+    }
+    if matches!(kind, Dialog::ExportFolder | Dialog::ImportFolder) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            editor.picked_path = path;
+            editor.dialog = Some(kind);
+            editor.discard = false;
+            editor.overwrite = false;
+        }
+        return;
+    }
     if !matches!(kind, Dialog::Exit) {
         let mut picker = rfd::FileDialog::new();
         if let Some(parent) = editor.path.parent().filter(|p| !p.as_os_str().is_empty()) {
             picker = picker.set_directory(parent);
         }
-        picker = if matches!(kind, Dialog::Import) {
+        picker = if matches!(kind, Dialog::ExportTexture) {
+            picker.add_filter("PNG texture", &["png"])
+        } else if matches!(kind, Dialog::Import) {
             picker.add_filter("Texture", &["png", "ktx2"])
         } else {
             picker.add_filter("BMAT material", &["bmat"])
         };
         let chosen = match kind {
+            Dialog::ExportTexture => picker.set_file_name("texture.png").save_file(),
             Dialog::Open | Dialog::Import => picker.pick_file(),
             _ => picker
                 .set_file_name(
@@ -472,29 +569,60 @@ fn texture_slot(
         }
     }
 }
-fn coat_input(ui: &mut egui::Ui, label: &str, factor: &mut Option<f32>, texture: &mut Option<String>, default_value: f32, sources: &[String], selected: &mut Option<(String, Option<usize>)>) {
+fn coat_input(
+    ui: &mut egui::Ui,
+    label: &str,
+    factor: &mut Option<f32>,
+    texture: &mut Option<String>,
+    default_value: f32,
+    sources: &[String],
+    selected: &mut Option<(String, Option<usize>)>,
+) {
     ui.push_id(label, |ui| {
         ui.label(label);
-        let mut mode = if texture.is_some() { 2 } else if factor.is_some() { 1 } else { 0 };
+        let mut mode = if texture.is_some() {
+            2
+        } else if factor.is_some() {
+            1
+        } else {
+            0
+        };
         let before = mode;
         ui.horizontal(|ui| {
             ui.selectable_value(&mut mode, 0, "None");
             ui.selectable_value(&mut mode, 1, "Constant");
-            ui.add_enabled_ui(!sources.is_empty(), |ui| { ui.selectable_value(&mut mode, 2, "Mask"); });
+            ui.add_enabled_ui(!sources.is_empty(), |ui| {
+                ui.selectable_value(&mut mode, 2, "Mask");
+            });
         });
         if mode != before {
             match mode {
-                0 => { *factor = None; *texture = None; }
-                1 => { *texture = None; factor.get_or_insert(default_value); }
-                _ => { *texture = sources.first().cloned(); *factor = Some(1.); }
+                0 => {
+                    *factor = None;
+                    *texture = None;
+                }
+                1 => {
+                    *texture = None;
+                    factor.get_or_insert(default_value);
+                }
+                _ => {
+                    *texture = sources.first().cloned();
+                    *factor = Some(1.);
+                }
             }
         }
         if mode == 1 {
-            if let Some(v) = factor { ui.add(egui::Slider::new(v, 0.0..=1.0)); }
+            if let Some(v) = factor {
+                ui.add(egui::Slider::new(v, 0.0..=1.0));
+            }
         } else if mode == 2 {
-            if let Some(src) = texture { embedded_picker(ui, label, src, sources, selected); }
+            if let Some(src) = texture {
+                embedded_picker(ui, label, src, sources, selected);
+            }
             // Preserve authored multipliers when opening an existing material.
-            if let Some(v) = factor { ui.add(egui::Slider::new(v, 0.0..=1.0).text("Multiplier")); }
+            if let Some(v) = factor {
+                ui.add(egui::Slider::new(v, 0.0..=1.0).text("Multiplier"));
+            }
         }
     });
 }
@@ -580,15 +708,177 @@ fn scalar(
         }
     }
 }
+fn changed(e: &mut Editor) {
+    e.dirty = e.doc != e.saved;
+    e.rebuild = true;
+    e.thumbnails.clear();
+    e.texture_info.clear();
+    if e.selected
+        .as_ref()
+        .is_some_and(|(key, _)| !e.doc.entries.contains_key(key))
+    {
+        e.selected = None;
+    }
+}
+fn history_step(e: &mut Editor, redo: bool) {
+    let success = if redo {
+        e.history.redo(&mut e.doc)
+    } else {
+        e.history.undo(&mut e.doc)
+    };
+    if success {
+        changed(e);
+        e.editing_gesture = false;
+        if let Some(w) = &mut e.watch {
+            w.enabled = false;
+        }
+        e.status = if redo {
+            "Redo (folder watching paused)"
+        } else {
+            "Undo (folder watching paused)"
+        }
+        .into();
+    }
+}
+fn set_watch(e: &mut Editor, path: PathBuf) {
+    let last = workflow::folder_stamp(&path).unwrap_or_default();
+    e.watch = Some(WatchFolder {
+        path,
+        enabled: false,
+        last,
+        pending: None,
+        next: Instant::now(),
+    });
+}
+fn poll_folder(e: &mut Editor) {
+    if e.dialog.is_some() || e.texture_action.is_some() {
+        return;
+    }
+    let Some(w) = &mut e.watch else {
+        return;
+    };
+    if !w.enabled || Instant::now() < w.next {
+        return;
+    }
+    w.next = Instant::now() + Duration::from_secs(1);
+    let stamp = match workflow::folder_stamp(&w.path) {
+        Ok(s) => s,
+        Err(err) => {
+            e.status = format!("Folder reload paused: {err}");
+            w.enabled = false;
+            return;
+        }
+    };
+    if stamp == w.last {
+        w.pending = None;
+        return;
+    }
+    // Require two stable observations so an external editor can finish writing.
+    if w.pending.as_ref() != Some(&stamp) {
+        w.pending = Some(stamp);
+        return;
+    }
+    let previous = e.doc.clone();
+    match workflow::reload_folder(&mut e.doc, &w.path) {
+        Ok(updated) => {
+            w.last = stamp;
+            w.pending = None;
+            if updated {
+                e.history.record(previous);
+                changed(e);
+                e.status =
+                    "External textures reloaded (undoable; BMAT not saved automatically)".into();
+            }
+        }
+        Err(err) => {
+            w.enabled = false;
+            e.status = format!("Folder reload paused; previous textures retained: {err}");
+        }
+    }
+}
+fn texture_action_ui(ctx: &egui::Context, e: &mut Editor) {
+    let Some((source, mut name, delete)) = e.texture_action.clone() else {
+        return;
+    };
+    let mut confirm = false;
+    let mut cancel = false;
+    egui::Window::new(if delete {
+        "Delete embedded texture"
+    } else {
+        "Rename embedded texture"
+    })
+    .collapsible(false)
+    .show(ctx, |ui| {
+        ui.label(&source);
+        if delete {
+            ui.label(
+                "Remove this texture and clear all its material references? This can be undone.",
+            );
+        } else {
+            ui.text_edit_singleline(&mut name);
+            ui.small("All material references will follow the new name.");
+        }
+        ui.horizontal(|ui| {
+            confirm = ui
+                .button(if delete { "Delete" } else { "Rename" })
+                .clicked();
+            cancel = ui.button("Cancel").clicked();
+        });
+    });
+    if cancel {
+        e.texture_action = None;
+        return;
+    }
+    e.texture_action = Some((source.clone(), name.clone(), delete));
+    if confirm {
+        let previous = e.doc.clone();
+        let result = if delete {
+            e.doc.delete_texture(&source).map(|()| None)
+        } else {
+            e.doc.rename_texture(&source, &name).map(Some)
+        };
+        match result {
+            Ok(key) => {
+                if previous != e.doc {
+                    e.history.record(previous);
+                }
+                e.selected = key.map(|key| (key, None));
+                changed(e);
+                e.texture_action = None;
+                if let Some(w) = &mut e.watch {
+                    w.enabled = false;
+                }
+                e.status = "Texture updated; export a fresh folder before watching renamed/deleted textures".into();
+            }
+            Err(err) => e.status = err,
+        }
+    }
+}
 fn ui(
     mut contexts: EguiContexts,
     mut editor: ResMut<Editor>,
-    mut cameras: Query<&mut Camera, With<Camera3d>>,
+    mut cameras: Query<(&mut Camera, &mut Transform), With<Camera3d>>,
+    mut orbit: ResMut<OrbitCamera>,
     windows: Query<&Window>,
     mut exit: MessageWriter<AppExit>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let e = &mut *editor;
+    poll_folder(e);
+    if !ctx.egui_wants_keyboard_input() && e.dialog.is_none() && e.texture_action.is_none() {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+            history_step(e, false);
+        }
+        if ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+                || i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::Z,
+                )
+        }) {
+            history_step(e, true);
+        }
+    }
     let mut root_ui = egui::Ui::new(
         ctx.clone(),
         egui::Id::new("editor-root"),
@@ -602,6 +892,8 @@ fn ui(
             egui::Panel::top("menu").show_inside(root, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button("File", |ui| {
+                        if ui.button("Export texture folder…").clicked() { dialog(e, Dialog::ExportFolder); ui.close(); }
+                        if ui.button("Reimport texture folder…").clicked() { dialog(e, Dialog::ImportFolder); ui.close(); }
                         if ui.button("New…").clicked() {
                             dialog(e, Dialog::New);
                             ui.close();
@@ -628,12 +920,18 @@ fn ui(
                             ui.close();
                         }
                     });
+                    ui.menu_button("Edit", |ui| {
+                        if ui.add_enabled(e.history.can_undo(), egui::Button::new("Undo    Ctrl+Z")).clicked() { history_step(e, false); ui.close(); }
+                        if ui.add_enabled(e.history.can_redo(), egui::Button::new("Redo    Ctrl+Shift+Z")).clicked() { history_step(e, true); ui.close(); }
+                    });
                     ui.label(format!(
                         "{}{}",
                         e.path.display(),
                         if e.dirty { " *" } else { "" }
                     ));
                     ui.checkbox(&mut e.rotate, "Rotate preview");
+                    if ui.button("Reset view").clicked() { *orbit = OrbitCamera::default(); }
+                    ui.label("Drag: orbit · Shift-drag/middle: pan · Scroll: zoom");
                 });
             });
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
@@ -641,6 +939,10 @@ fn ui(
             }
             egui::Panel::bottom("status").show_inside(root, |ui| {
                 ui.label(&e.status);
+                if let Some(w) = &mut e.watch {
+                    ui.checkbox(&mut w.enabled, "Watch exported textures");
+                    ui.small(w.path.display().to_string());
+                }
             });
             let before = e.doc.settings.clone();
             let sources: Vec<_> = e
@@ -813,6 +1115,11 @@ fn ui(
                         if let Some((src, channel)) = e.selected.clone() {
                             ui.separator();
                             ui.label(&src);
+                            ui.horizontal(|ui| {
+                                if ui.button("Export PNG…").clicked() { dialog(e, Dialog::ExportTexture); }
+                                if ui.button("Rename…").clicked() { e.texture_action = Some((src.clone(), std::path::Path::new(&src).file_stem().unwrap_or_default().to_string_lossy().into_owned(), false)); }
+                                if ui.button("Delete…").clicked() { e.texture_action = Some((src.clone(), String::new(), true)); }
+                            });
                             let key = format!("{src}:{channel:?}");
                             if !e.thumbnails.contains_key(&key) {
                                 match e.doc.pixels(&src) {
@@ -871,14 +1178,38 @@ fn ui(
                     });
                 });
             if before != e.doc.settings {
+                if !e.editing_gesture {
+                    let mut previous = e.doc.clone(); previous.settings = before;
+                    e.history.record(previous);
+                }
+                e.editing_gesture = ctx.input(|i| i.pointer.any_down());
                 e.dirty = true;
                 e.rebuild = true;
             }
-            root.available_rect_before_wrap()
+            let rect = root.available_rect_before_wrap();
+            let response = root.interact(rect, egui::Id::new("material-orbit-viewport"), egui::Sense::click_and_drag());
+            if e.dialog.is_none() && e.texture_action.is_none() {
+                if response.double_clicked() { *orbit = OrbitCamera::default(); }
+                let (delta, shift, scroll) = ctx.input(|i| (i.pointer.delta(), i.modifiers.shift, i.smooth_scroll_delta.y));
+                if response.dragged_by(egui::PointerButton::Middle) || (shift && response.dragged_by(egui::PointerButton::Primary)) {
+                    orbit.pan(delta, rect.height());
+                } else if response.dragged_by(egui::PointerButton::Primary) || response.dragged_by(egui::PointerButton::Secondary) {
+                    orbit.orbit(delta);
+                }
+                if response.hovered() { orbit.zoom(scroll); }
+            }
+            rect
         })
         .inner;
+    if !ctx.input(|i| i.pointer.any_down()) {
+        e.editing_gesture = false;
+    }
+    texture_action_ui(ctx, e);
     if let Some(kind) = e.dialog {
         egui::Window::new(match kind {
+            Dialog::ExportFolder => "Export to an empty texture directory",
+            Dialog::ImportFolder => "Reimport texture directory",
+            Dialog::ExportTexture => "Export texture PNG",
             Dialog::New => "New BMAT",
             Dialog::Exit => "Quit editor",
             Dialog::Open => "Open BMAT",
@@ -898,12 +1229,12 @@ fn ui(
                     import_options(ui, draft);
                 }
             }
-            let needs_overwrite = matches!(kind, Dialog::SaveAs) && path.exists();
+            let needs_overwrite = matches!(kind, Dialog::SaveAs | Dialog::ExportTexture) && path.exists();
             if needs_overwrite {
                 ui.checkbox(&mut e.overwrite, "Replace the existing file");
             }
             let needs_discard =
-                matches!(kind, Dialog::Open | Dialog::New | Dialog::Exit) && e.dirty;
+                matches!(kind, Dialog::Open | Dialog::New | Dialog::Exit | Dialog::ImportFolder) && e.dirty;
             if needs_discard {
                 ui.checkbox(&mut e.discard, "Discard unsaved changes");
             }
@@ -917,7 +1248,20 @@ fn ui(
                     )
                     .clicked()
                 {
+                    let previous = e.doc.clone();
                     match kind {
+                        Dialog::ExportFolder => match workflow::export_folder(&e.doc, &path) {
+                            Ok(()) => { set_watch(e, path); e.dialog = None; e.status = "Texture folder exported. Enable watching to reload external edits.".into(); }
+                            Err(err) => e.status = err,
+                        },
+                        Dialog::ImportFolder => match workflow::import_folder(&path) {
+                            Ok(doc) => { e.doc = doc; changed(e); set_watch(e, path); e.dialog = None; e.status = "Texture folder reimported (not yet saved)".into(); }
+                            Err(err) => e.status = err,
+                        },
+                        Dialog::ExportTexture => {
+                            let result = e.export_key.as_ref().ok_or_else(|| "Select a texture first".to_string()).and_then(|src| e.doc.texture_png(src)).and_then(|bytes| workflow::write_export(&path, &bytes));
+                            match result { Ok(()) => { e.dialog = None; e.status = "PNG exported".into(); }, Err(err) => e.status = err }
+                        },
                         Dialog::Exit => {
                             exit.write(AppExit::Success);
                         }
@@ -926,6 +1270,7 @@ fn ui(
                                 e.status = "Use Open for an existing file".into();
                             } else {
                                 e.doc = Document::default();
+                                e.history = History::default(); e.watch = None;
                                 e.path = path;
                                 e.dirty = true;
                                 e.rebuild = true;
@@ -940,6 +1285,7 @@ fn ui(
                         Dialog::Open => match Document::open(&path) {
                             Ok(doc) => {
                                 e.doc = doc;
+                                e.history = History::default(); e.watch = None; e.saved = e.doc.clone();
                                 e.path = path;
                                 e.dirty = false;
                                 e.rebuild = true;
@@ -974,6 +1320,7 @@ fn ui(
                             Err(err) => e.status = err,
                         },
                     }
+                    if !matches!(kind, Dialog::Open | Dialog::New) && previous != e.doc { e.history.record(previous); }
                 }
                 if ui.button("Cancel").clicked() {
                     e.dialog = None;
@@ -992,7 +1339,8 @@ fn ui(
         )
         .min(UVec2::new(window.physical_width(), window.physical_height()).saturating_sub(pos));
         if size.x > 0 && size.y > 0 {
-            for mut camera in &mut cameras {
+            for (mut camera, mut transform) in &mut cameras {
+                *transform = orbit.transform();
                 camera.viewport = Some(Viewport {
                     physical_position: pos,
                     physical_size: size,

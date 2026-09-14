@@ -61,7 +61,7 @@ impl Default for Settings {
         }
     }
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Document {
     pub settings: Settings,
     pub entries: BTreeMap<String, Vec<u8>>,

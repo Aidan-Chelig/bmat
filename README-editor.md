@@ -1,5 +1,40 @@
 # edbmat
 
+## Undo, export, and external editing
+
+- **Edit → Undo / Redo** (Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y; Command on macOS)
+  restores material edits, imports, folder reloads, and texture rename/delete.
+  Mouse drags are grouped into one undo step. Text fields keep their local text
+  undo; use the Edit menu for document undo while typing. History is in-memory,
+  capped at 32 snapshots / approximately 128 MiB (at least one large snapshot).
+- Select an **Embedded texture** to reveal **Export PNG**, **Rename**, and
+  **Delete**. Rename updates every material reference. Delete asks for confirmation,
+  clears references, and can be undone. Advanced PBR factors remain as constants
+  when their texture is removed.
+- **File → Export texture folder** writes all embedded source textures to an
+  empty directory as editable PNGs, plus `textures.ron` mappings and a
+  `material.bmat` backup containing the settings and original bytes. It refuses
+  nonempty directories. This folder is an external editing workspace; the saved
+  BMAT remains self-contained. Baked constants are settings, not separate sources.
+- **File → Reimport texture folder** restores the workspace's material settings
+  and edited images, retaining the current save destination. This is undoable;
+  Save is still required to write the changes to your BMAT.
+- After export/reimport, enable **Watch exported textures** in the status bar
+  to reload PNG edits into the current document. It polls once per second and
+  waits for two stable observations before reloading. Current material settings
+  are preserved; incomplete/invalid batches leave the old textures intact and
+  pause watching. Watching never saves automatically. Undo/redo and texture
+  rename/delete pause watching; export a fresh folder after renaming/deleting.
+
+PNG export is numeric data, without the preview checkerboard: R becomes grayscale,
+RG becomes RGB with B=0, RGB stays RGB, and RGBA retains alpha. The workspace
+remembers the original channel count and sRGB tag so RG returns as two-channel
+KTX2 on reimport. Unchanged exports retain their original embedded bytes;
+edited images are re-encoded as 8-bit, single-level KTX2. Keep `textures.ron`
+and `material.bmat` alongside the PNGs and do not rename those PNGs externally.
+
+## Material inputs
+
 Run `cargo run --bin edbmat -- /path/to/material.bmat`. An existing file is
 opened; a missing file starts a new material that will save at that path.
 The `editor` feature is enabled by default. Runtime consumers can use

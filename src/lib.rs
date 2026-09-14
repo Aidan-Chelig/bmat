@@ -25,6 +25,8 @@ pub use pbr::BmatPbr;
 pub mod converter;
 #[cfg(feature = "editor")]
 pub mod editor;
+#[cfg(feature = "editor")]
+pub mod editor_workflow;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BmatManifest {
