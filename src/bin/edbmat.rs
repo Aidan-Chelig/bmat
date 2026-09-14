@@ -44,6 +44,18 @@ struct Editor {
     material: Handle<StandardMaterial>,
     images: Vec<Handle<Image>>,
     rotate: bool,
+    tabs: Vec<MaterialTab>,
+    active_tab: usize,
+    explorer_root: PathBuf,
+}
+#[derive(Clone)]
+struct MaterialTab {
+    path: PathBuf,
+    project: bool,
+    export_path: PathBuf,
+    doc: Document,
+    saved: Document,
+    dirty: bool,
 }
 struct WatchFolder {
     path: PathBuf,
@@ -202,7 +214,7 @@ fn main() {
         ))
         .insert_resource(Editor {
             project,
-            export_path,
+            export_path: export_path.clone(),
             history: History::default(),
             saved: doc.clone(),
             editing_gesture: false,
@@ -211,8 +223,8 @@ fn main() {
             export_key: None,
             import_draft: None,
             texture_info: BTreeMap::new(),
-            path,
-            doc,
+            path: path.clone(),
+            doc: doc.clone(),
             dirty: false,
             rebuild: true,
             status,
@@ -225,6 +237,9 @@ fn main() {
             material: default(),
             images: Vec::new(),
             rotate: true,
+            tabs: vec![MaterialTab { path: path.clone(), project, export_path, doc: doc.clone(), saved: doc, dirty: false }],
+            active_tab: 0,
+            explorer_root: path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf(),
         })
         .insert_resource(ClearColor(Color::srgb(0.075, 0.085, 0.105)))
         .insert_resource(GlobalAmbientLight {
@@ -780,12 +795,73 @@ fn changed(e: &mut Editor) {
     e.rebuild = true;
     e.thumbnails.clear();
     e.texture_info.clear();
+    if let Some(tab) = e.tabs.get_mut(e.active_tab) {
+        tab.doc = e.doc.clone();
+        tab.saved = e.saved.clone();
+        tab.dirty = e.dirty;
+    }
     if e.selected
         .as_ref()
         .is_some_and(|(key, _)| !e.doc.entries.contains_key(key))
     {
         e.selected = None;
     }
+}
+fn sync_tab(e: &mut Editor) {
+    if let Some(tab) = e.tabs.get_mut(e.active_tab) {
+        tab.path = e.path.clone();
+        tab.project = e.project;
+        tab.export_path = e.export_path.clone();
+        tab.doc = e.doc.clone();
+        tab.saved = e.saved.clone();
+        tab.dirty = e.dirty;
+    }
+}
+fn switch_tab(e: &mut Editor, index: usize) {
+    if index >= e.tabs.len() || index == e.active_tab { return; }
+    sync_tab(e);
+    let tab = e.tabs[index].clone();
+    e.active_tab = index;
+    e.path = tab.path;
+    e.project = tab.project;
+    e.export_path = tab.export_path;
+    e.doc = tab.doc;
+    e.saved = tab.saved;
+    e.dirty = tab.dirty;
+    e.history = History::default();
+    e.selected = None;
+    e.thumbnails.clear();
+    e.texture_info.clear();
+    e.rebuild = true;
+    e.status = "Switched material tab".into();
+}
+fn open_material(e: &mut Editor, path: PathBuf) {
+    let existing = e.tabs.iter().position(|tab| tab.path == path);
+    if let Some(index) = existing { switch_tab(e, index); return; }
+    let loaded = if path.is_dir() {
+        Document::open_project(&path).map(|(doc, manifest)| (doc, true, manifest.export_path))
+    } else {
+        Document::open(&path).map(|doc| (doc, false, PathBuf::new()))
+    };
+    let Ok((doc, project, export_path)) = loaded else {
+        e.status = format!("Could not open {}", path.display());
+        return;
+    };
+    sync_tab(e);
+    e.tabs.push(MaterialTab { path: path.clone(), project, export_path: export_path.clone(), doc: doc.clone(), saved: doc.clone(), dirty: false });
+    e.active_tab = e.tabs.len() - 1;
+    e.path = path.clone();
+    e.project = project;
+    e.export_path = export_path;
+    e.doc = doc.clone();
+    e.saved = doc;
+    e.dirty = false;
+    e.history = History::default();
+    e.selected = None;
+    e.thumbnails.clear();
+    e.texture_info.clear();
+    e.rebuild = true;
+    e.status = format!("Opened {}", path.display());
 }
 fn history_step(e: &mut Editor, redo: bool) {
     let success = if redo {
@@ -1009,6 +1085,24 @@ fn ui(
                     ui.label("Drag: orbit · Shift-drag/middle: pan · Scroll: zoom");
                 });
             });
+            egui::Panel::top("tabs").show_inside(root, |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("material-tabs-scroll")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for index in 0..e.tabs.len() {
+                                let tab = &e.tabs[index];
+                                let name = tab.path.file_name().unwrap_or_default().to_string_lossy();
+                                let label = format!("{}{}", name, if tab.dirty { " *" } else { "" });
+                                if ui.selectable_label(index == e.active_tab, label).clicked() {
+                                    switch_tab(e, index);
+                                }
+                            }
+                        });
+                    }
+                );
+            });
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
                 save(e, e.path.clone());
             }
@@ -1019,6 +1113,33 @@ fn ui(
                     ui.small(w.path.display().to_string());
                 }
             });
+            egui::Panel::left("explorer")
+                .default_size(220.)
+                .size_range(160. ..=320.)
+                .show_inside(root, |ui| {
+                    ui.heading("Materials");
+                    ui.small(e.explorer_root.display().to_string());
+                    let mut projects = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(&e.explorer_root) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() && path.join(workflow::PROJECT_MANIFEST).is_file() {
+                                projects.push(path);
+                            }
+                        }
+                    }
+                    projects.sort();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for project in projects {
+                            let selected = e.project && e.path == project;
+                            let name = project.file_name().unwrap_or_default().to_string_lossy();
+                            let response = ui.selectable_label(selected, name);
+                            if response.double_clicked() {
+                                open_material(e, project);
+                            }
+                        }
+                    });
+                });
             let before = e.doc.settings.clone();
             let sources: Vec<_> = e
                 .doc
