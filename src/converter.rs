@@ -819,7 +819,7 @@ fn write_ktx2(
     fs::write(path, encode_ktx2(width, height, pixels, channels, srgb)?)
 }
 
-fn encode_ktx2(
+pub fn encode_ktx2(
     width: usize,
     height: usize,
     pixels: &[u8],
@@ -893,6 +893,7 @@ fn encode_ktx2_levels(
 ) -> io::Result<Vec<u8>> {
     let format = match (channels, srgb) {
         (1, false) => ktx2::Format::R8_UNORM,
+        (2, false) => ktx2::Format::R8G8_UNORM,
         (3, false) => ktx2::Format::R8G8B8_UNORM,
         (3, true) => ktx2::Format::R8G8B8_SRGB,
         (4, false) => ktx2::Format::R8G8B8A8_UNORM,

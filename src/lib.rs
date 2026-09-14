@@ -18,12 +18,18 @@ use bevy::{
 use bevy_trenchbroom::bevy_materialize::erased_material::ErasedMaterial;
 use bevy_trenchbroom::bevy_materialize::prelude::GenericMaterial;
 use serde::Deserialize;
+mod pbr;
+pub use pbr::BmatPbr;
 
 #[cfg(feature = "converter")]
 pub mod converter;
+#[cfg(feature = "editor")]
+pub mod editor;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BmatManifest {
+    #[serde(default)]
+    pub pbr: BmatPbr,
     pub version: u32,
     pub base_color_texture: Option<String>,
     pub normal_map_texture: Option<String>,
@@ -58,7 +64,7 @@ pub fn inspect_bmat(bytes: &[u8]) -> Result<BmatInspection, String> {
 /// `#[serde(default)]` on `BmatManifest::alpha_mode` means a `.bmat` built
 /// before this field existed still loads fine, defaulting to `Mask` (the
 /// previously-hardcoded behavior for every material).
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, serde::Serialize, Deserialize)]
 pub enum BmatAlphaMode {
     Opaque,
     #[default]
@@ -219,6 +225,7 @@ fn load_material_asset(
             Some(add_image(load_context, entries, path, false, revision)?);
     }
     if let Some(path) = &manifest.metallic_roughness_texture {
+        material.metallic = 1.0;
         let image = add_image(load_context, entries, path, false, revision)?;
         material.metallic_roughness_texture = Some(image.clone());
     }
@@ -232,6 +239,7 @@ fn load_material_asset(
         material.emissive_texture = Some(add_image(load_context, entries, path, true, revision)?);
     }
 
+    manifest.pbr.apply(&mut material, |path| add_image(load_context, entries, path, false, revision))?;
     let material_handle =
         load_context.add_labeled_asset(format!("standard_material_{revision:016x}"), material);
     Ok(GenericMaterial::new(material_handle))
@@ -258,14 +266,14 @@ fn content_revision(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn image_from_ktx2(
+pub fn image_from_ktx2(
     bytes: &[u8],
     is_srgb: bool,
     address_mode: ImageAddressMode,
 ) -> Result<Image, String> {
     let mut sampler = ImageSamplerDescriptor::linear();
     sampler.set_address_mode(address_mode);
-    Image::from_buffer(
+    let mut image = Image::from_buffer(
         bytes,
         ImageType::Extension("ktx2"),
         CompressedImageFormats::NONE,
@@ -273,7 +281,13 @@ fn image_from_ktx2(
         ImageSampler::Descriptor(sampler),
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    // Bevy interprets uncompressed one-row KTX2 images as D1. Material
+    // bindings are D2, including the 1x1 textures used for constants.
+    if image.texture_descriptor.dimension == bevy::render::render_resource::TextureDimension::D1 {
+        image.texture_descriptor.dimension = bevy::render::render_resource::TextureDimension::D2;
+    }
+    Ok(image)
 }
 
 /// Returns the dimensions of the primary texture in a BMAT bundle.
@@ -314,7 +328,7 @@ fn ktx2_size(bytes: &[u8]) -> Result<UVec2, String> {
     Ok(UVec2::new(width, height))
 }
 
-fn read_tar_entries(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
+pub fn read_tar_entries(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut entries = BTreeMap::new();
     let mut offset = 0;
     while offset + 512 <= bytes.len() {

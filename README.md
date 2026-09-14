@@ -1,5 +1,10 @@
 # bmat
 
+For direct material authoring, run `cargo run --bin edbmat -- material.bmat`.
+See [the editor guide](README-editor.md) for constants, masks, embedded textures,
+and File → Open / Save / Save As. Editor projects are saved inside the BMAT;
+no ORA source or settings sidecar is required.
+
 `bmat` provides a Bevy asset loader for BMAT material bundles and an
 `ora_to_bmat` command for compiling layered OpenRaster (`.ora`) or OpenEXR
 materials into those bundles.
