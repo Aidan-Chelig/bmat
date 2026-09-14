@@ -2,7 +2,8 @@
 
 For direct material authoring, run `cargo run --bin edbmat -- material.bmat`.
 See [the editor guide](README-editor.md) for constants, masks, embedded textures,
-and File → Open / Save / Save As. Editor projects are saved inside the BMAT;
+and File → Load Project / Save Project / Export BMAT. Editor projects keep
+their editable sources in a folder and export a runtime BMAT;
 no ORA source or settings sidecar is required.
 
 `bmat` provides a Bevy asset loader for BMAT material bundles and an

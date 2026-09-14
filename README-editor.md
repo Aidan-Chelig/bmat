@@ -1,5 +1,12 @@
 # edbmat
 
+Run `cargo run --bin edbmat -- /path/to/material.bmat` for a standalone BMAT,
+or point it at a project folder (existing or new, with no file extension).
+Projects contain `project.ron`, editable `sources/`, and a relative export path
+such as `build/material.bmat`; saving updates the project and its runtime archive.
+The `bmat_project_to_bmat <project-folder> [output-file] [--overwrite|-f]`
+command compiles projects from scripts or CI.
+
 ## Undo, export, and external editing
 
 - **Edit → Undo / Redo** (Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y; Command on macOS)
@@ -103,7 +110,8 @@ grayscale; one-channel images use grayscale, two-channel images use red/green,
 and alpha is composited over a checkerboard. Rotation can be paused in the
 top bar. The inspector scrolls and resizes independently of the preview.
 
-**File → New / Open / Save / Save As / Quit** manages documents; Ctrl+S saves.
+**File → New / Open BMAT / Load Project / Save Project / Save Project As /
+Export BMAT / Quit** manages documents; Ctrl+S saves the current project.
 New/Open/Save As/Import use native file pickers (the desktop's XDG portal on
 Linux, native dialogs on Windows/macOS). Linux needs a working XDG desktop
 portal with a file-chooser backend. Cancelling the picker leaves the document

@@ -1,6 +1,6 @@
 use bevy::{
-    core_pipeline::Skybox,
     camera::{CameraOutputMode, Viewport, visibility::RenderLayers},
+    core_pipeline::Skybox,
     image::ImageAddressMode,
     prelude::*,
     render::render_resource::BlendState,
@@ -20,6 +20,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Resource)]
 struct Editor {
+    project: bool,
+    export_path: PathBuf,
     history: History,
     saved: Document,
     editing_gesture: bool,
@@ -60,12 +62,14 @@ struct ImportDraft {
 }
 #[derive(Clone, Copy)]
 enum Dialog {
+    OpenProject,
+    SaveProjectAs,
+    ExportBmat,
     ExportFolder,
     ImportFolder,
     ExportTexture,
     New,
     Open,
-    SaveAs,
     Import,
     Exit,
 }
@@ -73,23 +77,38 @@ enum Dialog {
 struct Cube;
 
 #[derive(Resource)]
-struct OrbitCamera { target: Vec3, yaw: f32, pitch: f32, distance: f32 }
+struct OrbitCamera {
+    target: Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+}
 impl Default for OrbitCamera {
     fn default() -> Self {
         let pos = Vec3::new(3.5, 2.5, 5.);
-        Self { target: Vec3::ZERO, yaw: pos.x.atan2(pos.z), pitch: (pos.y / pos.length()).asin(), distance: pos.length() }
+        Self {
+            target: Vec3::ZERO,
+            yaw: pos.x.atan2(pos.z),
+            pitch: (pos.y / pos.length()).asin(),
+            distance: pos.length(),
+        }
     }
 }
 impl OrbitCamera {
-    fn rotation(&self) -> Quat { Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(-self.pitch) }
+    fn rotation(&self) -> Quat {
+        Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(-self.pitch)
+    }
     fn transform(&self) -> Transform {
-        Transform::from_translation(self.target + self.rotation() * Vec3::Z * self.distance).looking_at(self.target, Vec3::Y)
+        Transform::from_translation(self.target + self.rotation() * Vec3::Z * self.distance)
+            .looking_at(self.target, Vec3::Y)
     }
     fn orbit(&mut self, delta: egui::Vec2) {
         self.yaw = (self.yaw - delta.x * 0.007).rem_euclid(std::f32::consts::TAU);
         self.pitch = (self.pitch + delta.y * 0.007).clamp(-1.5, 1.5);
     }
-    fn zoom(&mut self, scroll: f32) { self.distance = (self.distance * (-scroll * 0.002).exp()).clamp(2.2, 50.); }
+    fn zoom(&mut self, scroll: f32) {
+        self.distance = (self.distance * (-scroll * 0.002).exp()).clamp(2.2, 50.);
+    }
     fn pan(&mut self, delta: egui::Vec2, height: f32) {
         let scale = 2. * self.distance * (std::f32::consts::FRAC_PI_8).tan() / height.max(1.);
         self.target += self.rotation() * Vec3::new(-delta.x, delta.y, 0.) * scale;
@@ -102,19 +121,26 @@ mod orbit_tests {
     #[test]
     fn default_view_matches_initial_camera() {
         let view = OrbitCamera::default().transform();
-        assert!(view.translation.abs_diff_eq(Vec3::new(3.5,2.5,5.), 0.00001));
-        assert!(view.forward().as_vec3().abs_diff_eq(-view.translation.normalize(), 0.00001));
+        assert!(
+            view.translation
+                .abs_diff_eq(Vec3::new(3.5, 2.5, 5.), 0.00001)
+        );
+        assert!(
+            view.forward()
+                .as_vec3()
+                .abs_diff_eq(-view.translation.normalize(), 0.00001)
+        );
     }
     #[test]
     fn orbit_and_zoom_remain_bounded() {
         let mut orbit = OrbitCamera::default();
-        orbit.orbit(egui::vec2(100000.,100000.));
+        orbit.orbit(egui::vec2(100000., 100000.));
         assert_eq!(orbit.pitch, 1.5);
         orbit.zoom(100000.);
         assert_eq!(orbit.distance, 2.2);
         orbit.zoom(-100000.);
         assert_eq!(orbit.distance, 50.);
-        orbit.pan(egui::vec2(10.,20.), 600.);
+        orbit.pan(egui::vec2(10., 20.), 600.);
         assert!(orbit.transform().translation.is_finite());
         assert_ne!(orbit.target, Vec3::ZERO);
     }
@@ -125,17 +151,40 @@ fn main() {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| "material.bmat".into());
-    let (doc, status) = if path.exists() {
+    let project_hint = path.extension().is_none();
+    let (doc, project, export_path, status) = if path.is_dir() {
+        match Document::open_project(&path) {
+            Ok((doc, manifest)) => (
+                doc,
+                true,
+                manifest.export_path,
+                "Opened BMAT project".into(),
+            ),
+            Err(e) => {
+                eprintln!("Cannot open project {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    } else if path.exists() {
         match Document::open(&path) {
-            Ok(doc) => (doc, "Opened material".into()),
+            Ok(doc) => (doc, false, PathBuf::new(), "Opened material".into()),
             Err(e) => {
                 eprintln!("Cannot open {}: {e}", path.display());
                 std::process::exit(1);
             }
         }
+    } else if project_hint {
+        (
+            Document::default(),
+            true,
+            PathBuf::from("build/material.bmat"),
+            "New BMAT project — Save to create the project".into(),
+        )
     } else {
         (
             Document::default(),
+            false,
+            PathBuf::new(),
             "New material — Save to create the BMAT".into(),
         )
     };
@@ -152,6 +201,8 @@ fn main() {
             EguiPlugin::default(),
         ))
         .insert_resource(Editor {
+            project,
+            export_path,
             history: History::default(),
             saved: doc.clone(),
             editing_gesture: false,
@@ -196,11 +247,14 @@ fn setup(
 ) {
     egui_settings.auto_create_primary_context = false;
     editor.material = materials.add(StandardMaterial::default());
-    let skybox = images.add(image_from_ktx2(
-        include_bytes!("../../assets/sky_skybox.ktx2"),
-        false,
-        ImageAddressMode::ClampToEdge,
-    ).expect("Bundled skybox must be a valid KTX2 cubemap"));
+    let skybox = images.add(
+        image_from_ktx2(
+            include_bytes!("../../assets/sky_skybox.ktx2"),
+            false,
+            ImageAddressMode::ClampToEdge,
+        )
+        .expect("Bundled skybox must be a valid KTX2 cubemap"),
+    );
     let mut cube = Mesh::from(Cuboid::from_length(2.));
     cube.generate_tangents()
         .expect("Preview cube has valid normals and UVs");
@@ -212,7 +266,11 @@ fn setup(
     ));
     commands.spawn((
         Camera3d::default(),
-        Skybox { image: Some(skybox), brightness: 1000.0, rotation: Quat::IDENTITY },
+        Skybox {
+            image: Some(skybox),
+            brightness: 1000.0,
+            rotation: Quat::IDENTITY,
+        },
         Transform::from_xyz(3.5, 2.5, 5.).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.spawn((
@@ -339,7 +397,12 @@ fn rebuild(
     }
 }
 fn save(editor: &mut Editor, path: PathBuf) {
-    match editor.doc.save(&path) {
+    let result = if editor.project {
+        editor.doc.save_project(&editor.path, &editor.export_path)
+    } else {
+        editor.doc.save(&path)
+    };
+    match result {
         Ok(()) => {
             editor.saved = editor.doc.clone();
             editor.path = path;
@@ -433,7 +496,10 @@ fn dialog(editor: &mut Editor, kind: Dialog) {
     if matches!(kind, Dialog::ExportTexture) {
         editor.export_key = editor.selected.as_ref().map(|(key, _)| key.clone());
     }
-    if matches!(kind, Dialog::ExportFolder | Dialog::ImportFolder) {
+    if matches!(
+        kind,
+        Dialog::OpenProject | Dialog::SaveProjectAs | Dialog::ExportFolder | Dialog::ImportFolder
+    ) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             editor.picked_path = path;
             editor.dialog = Some(kind);
@@ -447,7 +513,7 @@ fn dialog(editor: &mut Editor, kind: Dialog) {
         if let Some(parent) = editor.path.parent().filter(|p| !p.as_os_str().is_empty()) {
             picker = picker.set_directory(parent);
         }
-        picker = if matches!(kind, Dialog::ExportTexture) {
+        picker = if matches!(kind, Dialog::ExportTexture | Dialog::ExportBmat) {
             picker.add_filter("PNG texture", &["png"])
         } else if matches!(kind, Dialog::Import) {
             picker.add_filter("Texture", &["png", "ktx2"])
@@ -456,6 +522,7 @@ fn dialog(editor: &mut Editor, kind: Dialog) {
         };
         let chosen = match kind {
             Dialog::ExportTexture => picker.set_file_name("texture.png").save_file(),
+            Dialog::ExportBmat => picker.set_file_name("material.bmat").save_file(),
             Dialog::Open | Dialog::Import => picker.pick_file(),
             _ => picker
                 .set_file_name(
@@ -898,16 +965,24 @@ fn ui(
                             dialog(e, Dialog::New);
                             ui.close();
                         }
-                        if ui.button("Open…").clicked() {
+                        if ui.button("Open BMAT…").clicked() {
                             dialog(e, Dialog::Open);
                             ui.close();
                         }
-                        if ui.button("Save    Ctrl+S").clicked() {
+                        if ui.button("Load Project…").clicked() {
+                            dialog(e, Dialog::OpenProject);
+                            ui.close();
+                        }
+                        if ui.button("Save Project    Ctrl+S").clicked() {
                             save(e, e.path.clone());
                             ui.close();
                         }
-                        if ui.button("Save As…").clicked() {
-                            dialog(e, Dialog::SaveAs);
+                        if ui.button("Save Project As…").clicked() {
+                            dialog(e, Dialog::SaveProjectAs);
+                            ui.close();
+                        }
+                        if ui.button("Export BMAT…").clicked() {
+                            dialog(e, Dialog::ExportBmat);
                             ui.close();
                         }
                         ui.separator();
@@ -1207,13 +1282,15 @@ fn ui(
     texture_action_ui(ctx, e);
     if let Some(kind) = e.dialog {
         egui::Window::new(match kind {
+            Dialog::OpenProject => "Open BMAT project folder",
+            Dialog::SaveProjectAs => "Save BMAT project folder as",
+            Dialog::ExportBmat => "Export runtime BMAT",
             Dialog::ExportFolder => "Export to an empty texture directory",
             Dialog::ImportFolder => "Reimport texture directory",
             Dialog::ExportTexture => "Export texture PNG",
             Dialog::New => "New BMAT",
             Dialog::Exit => "Quit editor",
             Dialog::Open => "Open BMAT",
-            Dialog::SaveAs => "Save BMAT As",
             Dialog::Import => "Import PNG or KTX2",
         })
         .collapsible(false)
@@ -1229,12 +1306,12 @@ fn ui(
                     import_options(ui, draft);
                 }
             }
-            let needs_overwrite = matches!(kind, Dialog::SaveAs | Dialog::ExportTexture) && path.exists();
+            let needs_overwrite = matches!(kind, Dialog::ExportTexture | Dialog::ExportBmat) && path.exists();
             if needs_overwrite {
                 ui.checkbox(&mut e.overwrite, "Replace the existing file");
             }
             let needs_discard =
-                matches!(kind, Dialog::Open | Dialog::New | Dialog::Exit | Dialog::ImportFolder) && e.dirty;
+                matches!(kind, Dialog::Open | Dialog::OpenProject | Dialog::New | Dialog::Exit | Dialog::ImportFolder) && e.dirty;
             if needs_discard {
                 ui.checkbox(&mut e.discard, "Discard unsaved changes");
             }
@@ -1250,6 +1327,35 @@ fn ui(
                 {
                     let previous = e.doc.clone();
                     match kind {
+                        Dialog::SaveProjectAs => {
+                            let export_path = if e.export_path.as_os_str().is_empty() { PathBuf::from("build/material.bmat") } else { e.export_path.clone() };
+                            match e.doc.save_project(&path, &export_path) {
+                                Ok(()) => { e.project = true; e.path = path; e.export_path = export_path; e.saved = e.doc.clone(); e.dirty = false; e.dialog = None; e.status = "Project saved".into(); }
+                                Err(err) => e.status = err,
+                            }
+                        },
+                        Dialog::ExportBmat => match e.doc.save(&path) {
+                            Ok(()) => { e.dialog = None; e.status = "BMAT exported".into(); }
+                            Err(err) => e.status = err,
+                        },
+                        Dialog::OpenProject => match Document::open_project(&path) {
+                            Ok((doc, manifest)) => {
+                                e.doc = doc;
+                                e.path = path;
+                                e.project = true;
+                                e.export_path = manifest.export_path;
+                                e.saved = e.doc.clone();
+                                e.history = History::default();
+                                e.dirty = false;
+                                e.rebuild = true;
+                                e.selected = None;
+                                e.thumbnails.clear();
+                                e.texture_info.clear();
+                                e.dialog = None;
+                                e.status = "Opened BMAT project".into();
+                            }
+                            Err(err) => e.status = err,
+                        },
                         Dialog::ExportFolder => match workflow::export_folder(&e.doc, &path) {
                             Ok(()) => { set_watch(e, path); e.dialog = None; e.status = "Texture folder exported. Enable watching to reload external edits.".into(); }
                             Err(err) => e.status = err,
@@ -1272,6 +1378,8 @@ fn ui(
                                 e.doc = Document::default();
                                 e.history = History::default(); e.watch = None;
                                 e.path = path;
+                                e.project = false;
+                                e.export_path.clear();
                                 e.dirty = true;
                                 e.rebuild = true;
                                 e.selected = None;
@@ -1281,12 +1389,13 @@ fn ui(
                                 e.status = "New material".into();
                             }
                         }
-                        Dialog::SaveAs => save(e, path),
                         Dialog::Open => match Document::open(&path) {
                             Ok(doc) => {
                                 e.doc = doc;
                                 e.history = History::default(); e.watch = None; e.saved = e.doc.clone();
                                 e.path = path;
+                                e.project = false;
+                                e.export_path.clear();
                                 e.dirty = false;
                                 e.rebuild = true;
                                 e.selected = None;

@@ -9,6 +9,129 @@ use std::{
     time::SystemTime,
 };
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProjectManifest {
+    pub version: u32,
+    pub export_path: PathBuf,
+    pub settings: crate::editor::Settings,
+}
+
+pub const PROJECT_MANIFEST: &str = "project.ron";
+
+impl Document {
+    /// Open an editable BMAT project directory. Texture references use paths
+    /// relative to the project (normally `sources/...`).
+    pub fn open_project(dir: &Path) -> Result<(Self, ProjectManifest), String> {
+        if !dir.is_dir() {
+            return Err(format!("{} is not a BMAT project directory", dir.display()));
+        }
+        let manifest_path = dir.join(PROJECT_MANIFEST);
+        let manifest: ProjectManifest = ron::de::from_bytes(
+            &fs::read(&manifest_path)
+                .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?,
+        )
+        .map_err(|e| format!("invalid project manifest: {e}"))?;
+        if manifest.version != 1 {
+            return Err(format!(
+                "unsupported BMAT project version {}",
+                manifest.version
+            ));
+        }
+        if manifest.export_path.is_absolute()
+            || manifest
+                .export_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("project export_path must be relative and stay inside the project".into());
+        }
+        let mut entries = BTreeMap::new();
+        let sources = dir.join("sources");
+        if sources.exists() {
+            load_project_sources(&sources, &sources, &mut entries)?;
+        }
+        let doc = Self {
+            settings: manifest.settings.clone(),
+            entries,
+        };
+        doc.bake()?;
+        Ok((doc, manifest))
+    }
+
+    /// Write project.ron, source images, and the configured runtime BMAT export.
+    pub fn save_project(&self, dir: &Path, export_path: &Path) -> Result<(), String> {
+        if export_path.is_absolute()
+            || export_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("project export_path must be relative and stay inside the project".into());
+        }
+        fs::create_dir_all(dir.join("sources")).map_err(|e| e.to_string())?;
+        for (key, bytes) in self
+            .entries
+            .iter()
+            .filter(|(k, _)| k.starts_with("sources/"))
+        {
+            let relative = key.strip_prefix("sources/").ok_or("invalid source key")?;
+            if relative.is_empty()
+                || Path::new(relative)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err("invalid source path".into());
+            }
+            let path = dir.join("sources").join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            write_export(&path, bytes)?;
+        }
+        let manifest = ProjectManifest {
+            version: 1,
+            export_path: export_path.to_owned(),
+            settings: self.settings.clone(),
+        };
+        let ron = ron::ser::to_string_pretty(&manifest, ron::ser::PrettyConfig::default())
+            .map_err(|e| e.to_string())?;
+        write_export(&dir.join(PROJECT_MANIFEST), ron.as_bytes())?;
+        let output = dir.join(export_path);
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        self.save(&output)
+    }
+
+    pub fn project_export_path(dir: &Path) -> Result<PathBuf, String> {
+        let (_, manifest) = Self::open_project(dir)?;
+        Ok(dir.join(manifest.export_path))
+    }
+}
+
+fn load_project_sources(
+    root: &Path,
+    current: &Path,
+    entries: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), String> {
+    for item in fs::read_dir(current).map_err(|e| e.to_string())? {
+        let path = item.map_err(|e| e.to_string())?.path();
+        if path.is_dir() {
+            load_project_sources(root, &path, entries)?;
+            continue;
+        }
+        let relative = path.strip_prefix(root).map_err(|e| e.to_string())?;
+        let key = format!("sources/{}", relative.to_string_lossy().replace('\\', "/"));
+        if Path::new(&key)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("source path escapes project".into());
+        }
+        entries.insert(key, fs::read(path).map_err(|e| e.to_string())?);
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct History {
     undo: Vec<Document>,
@@ -469,6 +592,48 @@ mod tests {
         w.textures[0].file = "../outside.png".into();
         fs::write(dir.path().join(INDEX), ron::ser::to_string(&w).unwrap()).unwrap();
         assert!(import_folder(dir.path()).is_err());
+    }
+
+    #[test]
+    fn project_folder_is_source_of_truth_and_exports_relative_bmat() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("material-project");
+        let mut doc = doc(2);
+        doc.settings.albedo_none = false;
+        doc.settings.albedo = Some("sources/test.ktx2".into());
+        doc.save_project(&project, Path::new("build/material.bmat"))
+            .unwrap();
+        assert!(project.join(PROJECT_MANIFEST).is_file());
+        assert!(project.join("sources/test.ktx2").is_file());
+        assert!(project.join("build/material.bmat").is_file());
+        let (mut opened, manifest) = Document::open_project(&project).unwrap();
+        assert_eq!(manifest.export_path, PathBuf::from("build/material.bmat"));
+        assert_eq!(opened.settings.albedo.as_deref(), Some("sources/test.ktx2"));
+        let original = opened.entries["sources/test.ktx2"].clone();
+        opened.settings.roughness = ScalarInput::Constant(0.35);
+        opened
+            .save_project(&project, &manifest.export_path)
+            .unwrap();
+        let (reopened, _) = Document::open_project(&project).unwrap();
+        assert_eq!(reopened.entries["sources/test.ktx2"], original);
+        assert_eq!(
+            Document::project_export_path(&project).unwrap(),
+            project.join("build/material.bmat")
+        );
+    }
+
+    #[test]
+    fn project_rejects_absolute_or_parent_export_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = doc(1);
+        assert!(
+            doc.save_project(&dir.path().join("absolute"), Path::new("../escape.bmat"))
+                .is_err()
+        );
+        assert!(
+            doc.save_project(&dir.path().join("absolute2"), Path::new("/tmp/escape.bmat"))
+                .is_err()
+        );
     }
 }
 pub fn folder_stamp(dir: &Path) -> Result<Stamp, String> {

@@ -21,6 +21,16 @@ name = "edbmat"
 path = "src/bin/edbmat.rs"
 required-features = ["editor"]
 
+[[bin]]
+name = "bmat_project_to_bmat"
+path = "src/bin/bmat_project_to_bmat.rs"
+required-features = ["editor"]
+
+[[bin]]
+name = "ora_to_bmat_project"
+path = "src/bin/ora_to_bmat_project.rs"
+required-features = ["editor", "converter"]
+
 [dependencies]
 rfd = { version = "0.17.2", optional = true }
 bevy = { version = "0.19.1", features = ["pbr_multi_layer_material_textures", "pbr_transmission_textures", "pbr_anisotropy_texture"] }
