@@ -11,6 +11,7 @@ use bmat::{BmatAssetPlugin, BmatInspection, inspect_bmat};
 #[derive(Resource)]
 struct EditorState {
     path: PathBuf,
+    asset_name: String,
     inspection: Option<BmatInspection>,
 }
 
@@ -19,10 +20,12 @@ struct PreviewCube;
 
 fn main() {
     let path = env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("material.bmat"));
+    let asset_root = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    let asset_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("material.bmat").to_owned();
     let inspection = fs::read(&path).ok().and_then(|bytes| inspect_bmat(&bytes).ok());
     App::new()
-        .insert_resource(EditorState { path: path.clone(), inspection })
-        .add_plugins(DefaultPlugins)
+        .insert_resource(EditorState { path: path.clone(), asset_name, inspection })
+        .add_plugins(DefaultPlugins.set(AssetPlugin { file_path: asset_root.to_string_lossy().to_string(), ..default() }))
         .add_plugins(MaterializePlugin::new(bevy_materialize::prelude::TomlMaterialDeserializer))
         .add_plugins(BmatAssetPlugin)
         .add_systems(Startup, setup)
@@ -34,7 +37,7 @@ fn setup(mut commands: Commands, assets: Res<AssetServer>, state: Res<EditorStat
     commands.spawn((
         PreviewCube,
         Mesh3d(assets.add(Cuboid::from_length(2.0).into())),
-        GenericMaterial3d(assets.load(state.path.to_string_lossy().to_string())),
+        GenericMaterial3d(assets.load(state.asset_name.clone())),
         Transform::from_xyz(0.0, 0.0, 0.0),
     ));
     commands.spawn((Camera3d::default(), Transform::from_xyz(3.5, 2.5, 5.0).looking_at(Vec3::ZERO, Vec3::Y)));
