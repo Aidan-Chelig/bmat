@@ -15,9 +15,14 @@ name = "ora_to_bmat"
 path = "src/bin/ora_to_bmat.rs"
 required-features = ["converter"]
 
+[[bin]]
+name = "edbmat"
+path = "src/bin/edbmat.rs"
+
 [dependencies]
 bevy = { version = "0.19.1" }
 bevy_trenchbroom = { version = "0.14.0" }
+bevy_materialize = "0.11.0"
 ron = "0.11.0"
 serde = { version = "1.0", features = ["derive"] }
 exr = { version = "1.74.0", optional = true }

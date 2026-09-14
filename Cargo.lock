@@ -1961,6 +1961,7 @@ name = "bmat"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bevy_materialize",
  "bevy_trenchbroom",
  "exr",
  "glob",

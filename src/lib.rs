@@ -22,18 +22,34 @@ use serde::Deserialize;
 #[cfg(feature = "converter")]
 pub mod converter;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BmatManifest {
-    version: u32,
-    base_color_texture: Option<String>,
-    normal_map_texture: Option<String>,
-    metallic_roughness_texture: Option<String>,
-    occlusion_texture: Option<String>,
-    emissive_texture: Option<String>,
+    pub version: u32,
+    pub base_color_texture: Option<String>,
+    pub normal_map_texture: Option<String>,
+    pub metallic_roughness_texture: Option<String>,
+    pub occlusion_texture: Option<String>,
+    pub emissive_texture: Option<String>,
     #[serde(default)]
-    data_texture: Option<String>,
+    pub data_texture: Option<String>,
     #[serde(default)]
-    alpha_mode: BmatAlphaMode,
+    pub alpha_mode: BmatAlphaMode,
+}
+
+/// Lightweight archive inspection data used by editors and asset browsers.
+#[derive(Debug, Clone)]
+pub struct BmatInspection {
+    pub manifest: BmatManifest,
+    pub entries: Vec<String>,
+}
+
+pub fn inspect_bmat(bytes: &[u8]) -> Result<BmatInspection, String> {
+    let entries = read_tar_entries(bytes)?;
+    let manifest_bytes = entries
+        .get("manifest.ron")
+        .ok_or_else(|| "missing manifest.ron".to_owned())?;
+    let manifest = ron::de::from_bytes(manifest_bytes).map_err(|e| e.to_string())?;
+    Ok(BmatInspection { manifest, entries: entries.into_keys().collect() })
 }
 
 /// Mirrors `ora_to_ktx2.rs`'s `TextureAlphaMode` — the two are independently
