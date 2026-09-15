@@ -16,7 +16,7 @@ use bmat::{
     image_from_ktx2,
 };
 use std::time::{Duration, Instant};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 #[derive(Resource)]
 struct Editor {
@@ -63,6 +63,7 @@ struct WatchFolder {
     last: Stamp,
     pending: Option<Stamp>,
     next: Instant,
+    project: bool,
 }
 struct ImportDraft {
     pixels: Pixels,
@@ -159,10 +160,26 @@ mod orbit_tests {
 }
 
 fn main() {
-    let path = std::env::args_os()
+    let supplied_path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| "material.bmat".into());
+    let project_folder = supplied_path.is_dir()
+        && !supplied_path.join(workflow::PROJECT_MANIFEST).is_file();
+    let path = if project_folder {
+        let mut projects = fs::read_dir(&supplied_path)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && path.join(workflow::PROJECT_MANIFEST).is_file())
+            .collect::<Vec<_>>();
+        projects.sort();
+        projects.into_iter().next().unwrap_or(supplied_path.clone())
+    } else {
+        supplied_path.clone()
+    };
     let project_hint = path.extension().is_none();
     let (doc, project, export_path, status) = if path.is_dir() {
         match Document::open_project(&path) {
@@ -239,7 +256,11 @@ fn main() {
             rotate: true,
             tabs: vec![MaterialTab { path: path.clone(), project, export_path, doc: doc.clone(), saved: doc, dirty: false }],
             active_tab: 0,
-            explorer_root: path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf(),
+            explorer_root: if project_folder {
+                supplied_path
+            } else {
+                path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf()
+            },
         })
         .insert_resource(ClearColor(Color::srgb(0.075, 0.085, 0.105)))
         .insert_resource(GlobalAmbientLight {
@@ -261,6 +282,10 @@ fn setup(
     mut egui_settings: ResMut<EguiGlobalSettings>,
 ) {
     egui_settings.auto_create_primary_context = false;
+    if editor.project && editor.watch.is_none() {
+        let path = editor.path.clone();
+        set_project_watch(&mut editor, path);
+    }
     editor.material = materials.add(StandardMaterial::default());
     let skybox = images.add(
         image_from_ktx2(
@@ -807,6 +832,15 @@ fn changed(e: &mut Editor) {
         e.selected = None;
     }
 }
+/// Restore the last on-disk project snapshot when the user discards edits.
+/// This also undoes edits made by an external tool after the project was opened.
+fn restore_discarded_project(e: &mut Editor) -> bool {
+    if !(e.project && e.dirty) { return true; }
+    match e.saved.save_project(&e.path, &e.export_path) {
+        Ok(()) => true,
+        Err(err) => { e.status = format!("Could not restore discarded project: {err}"); false }
+    }
+}
 fn sync_tab(e: &mut Editor) {
     if let Some(tab) = e.tabs.get_mut(e.active_tab) {
         tab.path = e.path.clone();
@@ -834,6 +868,7 @@ fn switch_tab(e: &mut Editor, index: usize) {
     e.texture_info.clear();
     e.rebuild = true;
     e.status = "Switched material tab".into();
+    if e.project { set_project_watch(e, e.path.clone()); } else { e.watch = None; }
 }
 fn open_material(e: &mut Editor, path: PathBuf) {
     let existing = e.tabs.iter().position(|tab| tab.path == path);
@@ -862,6 +897,7 @@ fn open_material(e: &mut Editor, path: PathBuf) {
     e.texture_info.clear();
     e.rebuild = true;
     e.status = format!("Opened {}", path.display());
+    if project { set_project_watch(e, path); } else { e.watch = None; }
 }
 fn history_step(e: &mut Editor, redo: bool) {
     let success = if redo {
@@ -891,7 +927,12 @@ fn set_watch(e: &mut Editor, path: PathBuf) {
         last,
         pending: None,
         next: Instant::now(),
+        project: false,
     });
+}
+fn set_project_watch(e: &mut Editor, path: PathBuf) {
+    let last = workflow::project_stamp(&path).unwrap_or_default();
+    e.watch = Some(WatchFolder { path, enabled: true, last, pending: None, next: Instant::now(), project: true });
 }
 fn poll_folder(e: &mut Editor) {
     if e.dialog.is_some() || e.texture_action.is_some() {
@@ -900,11 +941,12 @@ fn poll_folder(e: &mut Editor) {
     let Some(w) = &mut e.watch else {
         return;
     };
+    let project_watch = w.project;
     if !w.enabled || Instant::now() < w.next {
         return;
     }
     w.next = Instant::now() + Duration::from_secs(1);
-    let stamp = match workflow::folder_stamp(&w.path) {
+    let stamp = match if w.project { workflow::project_stamp(&w.path) } else { workflow::folder_stamp(&w.path) } {
         Ok(s) => s,
         Err(err) => {
             e.status = format!("Folder reload paused: {err}");
@@ -922,15 +964,27 @@ fn poll_folder(e: &mut Editor) {
         return;
     }
     let previous = e.doc.clone();
-    match workflow::reload_folder(&mut e.doc, &w.path) {
+    let result = if w.project {
+        Document::open_project(&w.path).map(|(updated, _)| {
+            let changed = updated != e.doc;
+            if changed { e.doc = updated; }
+            changed
+        })
+    } else {
+        workflow::reload_folder(&mut e.doc, &w.path)
+    };
+    match result {
         Ok(updated) => {
             w.last = stamp;
             w.pending = None;
             if updated {
                 e.history.record(previous);
                 changed(e);
-                e.status =
-                    "External textures reloaded (undoable; BMAT not saved automatically)".into();
+                e.status = if project_watch {
+                    "Project changed externally; review, save, or discard to restore the previous files".into()
+                } else {
+                    "External textures reloaded (undoable; BMAT not saved automatically)".into()
+                };
             }
         }
         Err(err) => {
@@ -1109,7 +1163,7 @@ fn ui(
             egui::Panel::bottom("status").show_inside(root, |ui| {
                 ui.label(&e.status);
                 if let Some(w) = &mut e.watch {
-                    ui.checkbox(&mut w.enabled, "Watch exported textures");
+                    ui.checkbox(&mut w.enabled, if w.project { "Watch project files" } else { "Watch exported textures" });
                     ui.small(w.path.display().to_string());
                 }
             });
@@ -1459,7 +1513,7 @@ fn ui(
                             Ok(()) => { e.dialog = None; e.status = "BMAT exported".into(); }
                             Err(err) => e.status = err,
                         },
-                        Dialog::OpenProject => match Document::open_project(&path) {
+                        Dialog::OpenProject => if restore_discarded_project(e) { match Document::open_project(&path) {
                             Ok((doc, manifest)) => {
                                 e.doc = doc;
                                 e.path = path;
@@ -1472,11 +1526,12 @@ fn ui(
                                 e.selected = None;
                                 e.thumbnails.clear();
                                 e.texture_info.clear();
+                                set_project_watch(e, e.path.clone());
                                 e.dialog = None;
                                 e.status = "Opened BMAT project".into();
                             }
                             Err(err) => e.status = err,
-                        },
+                        } },
                         Dialog::ExportFolder => match workflow::export_folder(&e.doc, &path) {
                             Ok(()) => { set_watch(e, path); e.dialog = None; e.status = "Texture folder exported. Enable watching to reload external edits.".into(); }
                             Err(err) => e.status = err,
@@ -1490,10 +1545,12 @@ fn ui(
                             match result { Ok(()) => { e.dialog = None; e.status = "PNG exported".into(); }, Err(err) => e.status = err }
                         },
                         Dialog::Exit => {
-                            exit.write(AppExit::Success);
+                            if restore_discarded_project(e) { exit.write(AppExit::Success); }
                         }
                         Dialog::New => {
-                            if path.exists() {
+                            if !restore_discarded_project(e) {
+                                e.dialog = None;
+                            } else if path.exists() {
                                 e.status = "Use Open for an existing file".into();
                             } else {
                                 e.doc = Document::default();
@@ -1510,7 +1567,7 @@ fn ui(
                                 e.status = "New material".into();
                             }
                         }
-                        Dialog::Open => match Document::open(&path) {
+                        Dialog::Open => if restore_discarded_project(e) { match Document::open(&path) {
                             Ok(doc) => {
                                 e.doc = doc;
                                 e.history = History::default(); e.watch = None; e.saved = e.doc.clone();
@@ -1526,7 +1583,7 @@ fn ui(
                                 e.status = "Opened material".into();
                             }
                             Err(err) => e.status = err,
-                        },
+                        } },
                         Dialog::Import => match e
                             .import_draft
                             .as_ref()

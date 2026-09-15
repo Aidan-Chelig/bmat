@@ -645,3 +645,30 @@ pub fn folder_stamp(dir: &Path) -> Result<Stamp, String> {
     }
     Ok(result)
 }
+
+/// Stamp the editable portion of a BMAT project. Generated exports are
+/// intentionally excluded so exporting a project does not look like an
+/// external edit.
+pub fn project_stamp(dir: &Path) -> Result<Stamp, String> {
+    if !dir.is_dir() { return Err(format!("{} is not a project directory", dir.display())); }
+    let mut files = Vec::new();
+    let manifest = dir.join(PROJECT_MANIFEST);
+    if manifest.is_file() { files.push(manifest); }
+    let sources = dir.join("sources");
+    collect_project_files(&sources, &mut files)?;
+    files.sort();
+    files.into_iter().map(|path| {
+        let rel = path.strip_prefix(dir).map_err(|e| e.to_string())?.to_string_lossy().replace('\\', "/");
+        let m = fs::metadata(&path).map_err(|e| e.to_string())?;
+        Ok((rel, m.len(), m.modified().ok()))
+    }).collect()
+}
+
+fn collect_project_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    if !dir.exists() { return Ok(()); }
+    for item in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let path = item.map_err(|e| e.to_string())?.path();
+        if path.is_dir() { collect_project_files(&path, out)?; } else { out.push(path); }
+    }
+    Ok(())
+}
